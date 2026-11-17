@@ -1,4 +1,6 @@
-# DEGHEIDY Multilingual AI Chatbot
+# DEGHEIDY Multilingual AI 
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YousefDegheidy/multilingual-ai-chatbot/blob/main/DEGHEIDY_Chatbot_V10_Colab.ipynb)
 
 **A multilingual, context-aware AI chatbot with Arabic-English conversation support, speech recognition, and streaming responses.**
 
