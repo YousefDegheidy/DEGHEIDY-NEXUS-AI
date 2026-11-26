@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 import threading
+import ctypes
 from functools import lru_cache
 from typing import Callable
 
@@ -99,60 +100,136 @@ def _get_vad():
     return webrtcvad.Vad(1)
 
 
-@lru_cache(maxsize=1)
-def load_asr():
-    """Lazy ASR load; GPU high-accuracy; CPU lightweight alternative.
 
-    This does not need Qwen chat and can run while Colab GPU is exhausted.
-    """
-    import torch
+# Use the COMPLETE captured microphone recording by default. In streaming mode,
+# Gradio's stop event may race with the last chunk or a VAD silence boundary.
+# The old live implementation is retained for compatibility but NOT the default UI.
+ASR_OPTIONS = [
+    ('تلقائي (GPU Turbo إن توفرت الذاكرة، وإلا CPU Medium)', 'auto'),
+    ('أعلى دقة على GPU: Whisper Large-v3 (أبطأ)', 'accurate'),
+    ('دقة أعلى على CPU: Whisper Medium (أبطأ)', 'medium'),
+    ('سريع على CPU: Whisper Small (أقل دقة)', 'small'),
+]
+
+
+def audio_diagnostics(audio) -> dict:
+    """Inspect the received waveform, no model or network needed."""
+    if audio is None:
+        return {'ok':False,'reason':'المتصفح لم يرسل تسجيلًا. افحص إذن الميكروفون واختر جهاز الإدخال الصحيح.'}
+    try:
+        sr, samples = audio
+        original = np.asarray(samples)
+        raw_len = original.shape[0] if original.ndim else 0
+        signal = normalize_audio(audio)
+        if not raw_len or signal.size==0:
+            return {'ok':False,'reason':'وصل ملف صوتي فارغ.'}
+        rms=float(np.sqrt(np.mean(signal*signal)))
+        peak=float(np.max(np.abs(signal)))
+        duration=round(len(signal)/SAMPLE_RATE,2)
+        # Low RMS is diagnostic only: don't drop quiet speech based on volume.
+        ok = duration >= .7 and rms >= .00030
+        reason = ('التسجيل قصير جدًا؛ سجل 4–10 ثوانٍ على الأقل.' if duration<.7 else
+                  'الصوت منخفض جدًا. ارفع مستوى الميكروفون وراجع اختيار جهاز الإدخال.' if rms<.00030 else
+                  'الصوت وصل للسيرفر بالكامل؛ تقدر تشغّله من مشغل الصوت قبل تحويله.')
+        return {'ok':ok,'duration_s':duration,'sample_rate':int(sr),
+                'channels':int(original.shape[1]) if original.ndim==2 else 1,
+                'rms':round(rms,5),'peak':round(peak,5),
+                'clipping':bool(np.mean(np.abs(signal)>.995)>.03),
+                'reason':reason}
+    except Exception as exc:
+        return {'ok':False,'reason':f'تعذّر قراءة التسجيل: {type(exc).__name__}: {str(exc)[:90]}'}
+
+
+def describe_audio(audio):
+    data=audio_diagnostics(audio)
+    if not data['ok']:
+        return '⚠️ '+data['reason'] + (f" (المدة {data['duration_s']} ثانية)" if 'duration_s' in data else '')
+    return (f"🎤 التسجيل وصل: {data['duration_s']} ثانية؛ معدل العينات الأصلي {data['sample_rate']} Hz؛ "
+            f"{data['channels']} قناة؛ RMS={data['rms']}؛ Peak={data['peak']}. "
+            + ('⚠️ يوجد تقطيع صوتي بسبب ارتفاع المستوى.' if data['clipping'] else '✅ '+data['reason']))
+
+
+def _gpu_asr_ready(required_bytes=4*1024**3):
+    try:
+        import torch
+        if not torch.cuda.is_available() or os.getenv('DEGHEIDY_ASR_CPU_ONLY')=='1':
+            return False
+        ctypes.CDLL('libcublas.so.12')
+        free,_=torch.cuda.mem_get_info()
+        return free>=required_bytes
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=4)
+def _load_by_profile(mode):
     from faster_whisper import WhisperModel
-    gpu = bool(torch.cuda.is_available())
-    model_pref = os.getenv('DEGHEIDY_STT_MODEL', 'large-v3' if gpu else 'small').strip()
-    if gpu:
-        candidates = [model_pref] + [x for x in ('medium', 'small') if x != model_pref]
-        device, compute = 'cuda', 'float16'
+    import torch
+    mode=(mode or 'auto').lower().strip()
+    if mode=='small':
+        candidates=[('small','cpu','int8')]
+    elif mode=='medium':
+        candidates=[('medium','cpu','int8'),('small','cpu','int8')]
+    elif mode=='accurate':
+        candidates=([('large-v3','cuda','int8_float16')] if _gpu_asr_ready(6*1024**3) else [])
+        candidates += [('medium','cpu','int8'),('small','cpu','int8')]
     else:
-        candidates = [model_pref] + [x for x in ('small', 'base') if x != model_pref]
-        device, compute = 'cpu', 'int8'
-    last_error = None
-    for key in candidates:
+        candidates=([('large-v3-turbo','cuda','int8_float16')] if _gpu_asr_ready() else [])
+        candidates += [('medium','cpu','int8'),('small','cpu','int8')]
+    errors=[]
+    for model_id,device,compute in candidates:
         try:
-            print(f'Loading ASR {key} on {device}/{compute} (model downloads only once if cached)')
-            m = WhisperModel(key, device=device, compute_type=compute,
-                             cpu_threads=4 if not gpu else 0)
-            print('ASR model ready:', key)
-            return m, f'Whisper {key} ({device})'
+            print(f'[ASR] loading {model_id} on {device} ({compute})',flush=True)
+            model=WhisperModel(model_id,device=device,compute_type=compute,
+                               cpu_threads=4 if device=='cpu' else 0)
+            return model,f'Whisper {model_id} ({device})'
         except Exception as exc:
-            last_error = exc
-            print('Speech engine load failed:', key, str(exc)[:180])
-            if gpu:
+            errors.append(f'{model_id}/{device}: {type(exc).__name__}: {str(exc)[:80]}')
+            print('[ASR FALLBACK]',errors[-1],flush=True)
+            if device=='cuda' and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    raise RuntimeError('All speech models failed to load: '+str(last_error))
+    raise RuntimeError('Cannot load ASR model; '+'; '.join(errors))
 
 
-def transcribe_signal(signal: np.ndarray) -> str:
-    """No language switch; VAD + no previous text conditioning mitigates hallucination."""
-    signal = np.asarray(signal, dtype=np.float32)
-    if signal.size < SAMPLE_RATE * .4 or np.sqrt(np.mean(signal**2)) < .002:
+def load_asr(mode='auto'):
+    """Compatible wrapper. Does NOT download Qwen and won't evict chat weights."""
+    return _load_by_profile(mode)
+
+
+def transcribe_signal(signal: np.ndarray, mode='auto') -> str:
+    """Whole utterance speech recognition. NEVER remove words using per-chunk VAD."""
+    signal = np.asarray(signal,dtype=np.float32)
+    if signal.size < SAMPLE_RATE*.7 or float(np.sqrt(np.mean(signal**2)))<.0003:
         return ''
     with ASR_LOCK:
-        model, _ = load_asr()
-        segments, info = model.transcribe(
-            signal, task='transcribe', language=None, beam_size=5,
-            temperature=0, condition_on_previous_text=False,
-            vad_filter=True, vad_parameters={'min_silence_duration_ms':500},
-            multilingual=True,  # re-detect language across segments when possible
-            no_speech_threshold=.65, compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-        )
-        parts = []
-        for seg in segments:
-            txt = re.sub(r'\s+', ' ', seg.text).strip()
-            if txt:
-                parts.append(txt)
-    return ' '.join(parts)
-
+        for attempt in range(2):
+            try:
+                model,description=load_asr(mode)
+                print('[ASR] inference length_s=',round(len(signal)/SAMPLE_RATE,1),
+                      'model=',description,flush=True)
+                t0=__import__('time').perf_counter()
+                segments,info=model.transcribe(
+                    signal,task='transcribe',language=None,beam_size=5,
+                    temperature=0,condition_on_previous_text=False,
+                    vad_filter=False,multilingual=True,
+                    no_speech_threshold=.7,compression_ratio_threshold=2.4,
+                    log_prob_threshold=-1.0,
+                    initial_prompt='The speaker may switch between Arabic and English and mention AI, '
+                                   'Python, TensorFlow, PyTorch, MediaPipe, OpenCV, FastAPI, RAG and Chatbot.'
+                )
+                texts=[re.sub(r'\s+',' ',s.text).strip() for s in segments]
+                result=' '.join(t for t in texts if t)
+                print('[ASR] took_s=',round(__import__('time').perf_counter()-t0,2),
+                      '| detected_language=',getattr(info,'language','?'),flush=True)
+                return result
+            except (RuntimeError, OSError) as exc:
+                msg=str(exc).lower()
+                if attempt==0 and mode not in ('medium','small') and any(
+                     x in msg for x in ('cublas','cudnn','cuda','out of memory','ct2')):
+                    print('[ASR] GPU failed, retrying CPU Medium:',str(exc)[:180],flush=True)
+                    mode='medium';continue
+                raise
+    return ''
 
 def _commit(st: dict, recognizer: Callable[[np.ndarray], str]):
     """Finalize unique UNCOMMITTED speech once; never carry acoustic overlap."""
@@ -237,18 +314,68 @@ def finalize_audio(state: dict, recognizer=transcribe_signal):
     return voice_view(st), st, st['status']
 
 
-def transcription_of_file(audio, current_draft: str, recognizer=transcribe_signal):
+def transcription_of_file(audio, current_draft: str, recognizer=transcribe_signal, mode='auto'):
     if audio is None:
         return current_draft or '', 'سجل أو ارفع صوتًا أولًا.'
+    report=audio_diagnostics(audio)
+    if not report['ok']:
+        return current_draft or '', '⚠️ '+report['reason']
     wave = normalize_audio(audio)
     if len(wave) == 0:
         return current_draft or '', 'الملف الصوتي فارغ.'
     if len(wave) > 120 * SAMPLE_RATE:
         return current_draft or '', 'ارفع تسجيلًا أقصر من دقيقتين للتجربة.'
     try:
-        result = recognizer(wave)
+        # Allow legacy injected single-argument recognizers in unit tests.
+        result = transcribe_signal(wave, mode=mode) if recognizer is transcribe_signal else recognizer(wave)
         if not result:
-            return current_draft or '', 'مفيش كلام واضح اتسمع في التسجيل.'
-        return append_text(current_draft or '', result), '✅ اتفرّغ التسجيل تلقائيًا؛ راجع النص.'
+            return current_draft or '', '⚠️ وصل الصوت لكن Whisper مرجعش كلمات واضحة. جرّب وضع أعلى دقة أو سجّل بجملة أطول. '+describe_audio(audio)
+        return append_text(current_draft or '', result), '✅ اتفرّغ التسجيل كاملًا؛ راجع النص قبل الإرسال. '+describe_audio(audio)
     except Exception as exc:
         return current_draft or '', f'مشكلة في تحويل الصوت: {type(exc).__name__}: {str(exc)[:140]}'
+
+
+def edit_distance(a, b) -> int:
+    """Deterministic Levenshtein distance for a short ASR reference and hypothesis."""
+    prev=list(range(len(b)+1))
+    for i,x in enumerate(a,1):
+        curr=[i]
+        for j,y in enumerate(b,1):
+            curr.append(min(curr[-1]+1,prev[j]+1,prev[j-1]+(x!=y)))
+        prev=curr
+    return prev[-1]
+
+
+def normalize_reference(text: str) -> str:
+    import unicodedata
+    t=unicodedata.normalize('NFKC',text or '').lower()
+    t=re.sub(r'[\u064b-\u065f\u0670\u0640]','',t)
+    t=t.translate(str.maketrans('أإآى','اااي'))
+    return re.sub(r'[^\w\u0621-\u064a]+',' ',t).strip()
+
+
+def speech_accuracy_test(audio, reference, mode='auto'):
+    """Actually transcribe ONE captured recording on the user's Colab runtime."""
+    info=audio_diagnostics(audio)
+    if not info['ok']:
+        return '', '⚠️ '+info['reason']
+    reference=normalize_reference(reference)
+    if not reference:
+        return '', '⚠️ اكتب النص اللي قلته في خانة Reference عشان نحسب WER.'
+    import time
+    start=time.perf_counter()
+    try:
+        recognized=transcribe_signal(normalize_audio(audio),mode)
+        secs=time.perf_counter()-start
+        truth=reference.split()
+        candidate=normalize_reference(recognized).split()
+        wer=edit_distance(truth,candidate)/max(len(truth),1)
+        ref_chars=list(reference.replace(' ',''))
+        hyp_chars=list(normalize_reference(recognized).replace(' ',''))
+        cer=edit_distance(ref_chars,hyp_chars)/max(len(ref_chars),1)
+        return recognized,(f'📊 **اختبار صوت حقيقي على تسجيلك** — المدة {info["duration_s"]} ثانية؛ '
+                           f'وقت التفريغ {secs:.1f} ثانية؛ '
+                           f'**WER={wer:.1%}، CER={cer:.1%}**. '
+                           'الأقل أفضل. الأرقام دي لتسجيلك ده فقط، مش دقة عامة للنموذج.')
+    except Exception as exc:
+        return '',f'⚠️ ASR benchmark failed: {type(exc).__name__}: {str(exc)[:180]}'

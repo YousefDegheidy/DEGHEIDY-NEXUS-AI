@@ -1,0 +1,16 @@
+# DEGHEIDY QA74 — Quality & Consistency upgrade (24 Nov 2026)
+
+**Release candidate — not quality-certified.** This is the existing QA74 application, not a different model. Keep the user's trained Qwen3.5-4B LoRA archive. No new training or API key is necessary for these changes.
+
+## Changes
+- Identical adjacent, successful static questions may reuse the previous verified-structure answer within the same session. News, time-sensitive requests, correction/follow-up requests, interrupted/failed responses and changed conversation context are not reused. Greedy inference remains `do_sample=False`; this is not a global determinism guarantee.
+- Explicit counted career plans, single-month edits and RAG architecture requests with hallucination mitigations are buffered, checked against requested structure, and repaired at most once. If still incomplete the app labels the answer; no second competing draft is published. This can add latency. Structural validation does not prove semantic correctness.
+- Explicit factual-news/direct-source requests get conservative source selection, with analysis titles, analysis publisher/path signals, unreadable pages and aggregator URLs excluded. Returned extracts are not independent fact verification; where event dates are unavailable they remain unknown. Filtering may return fewer results, and extractive snippets are not guaranteed full summaries.
+- Supported company-service rumors use actual domain-restricted searches and official-page reading, rather than only dated news RSS. No fabricated official announcement or inference of categorical denial. The route is conservative: it presents found evidence and limits, not an automatic final adjudication of a complex announcement.
+- Original speech, calculator, job-manager, adapter loader, training script and GPU-session helpers retained unchanged. Start Chat Only launcher uses a new verified-local HTTP server, as in the previous successful session.
+
+## How to use
+Current Colab session: paste `QA74_QUALITY_NEXT_UPDATE_AND_START.py` as one new code cell. It unpacks the full source into a separate directory, copies the existing adapter if available (or asks for the saved adapter ZIP), closes only notebook-owned UI processes, and opens a new interface. No package installation or training in this path. Fresh Colab: use the notebook stages, install dependencies in Stage 1 only as needed, upload the saved adapter in Stage 2, launch Stage 3. Stage 4 stops the UI and runs two actual acceptance runs with the same adapter. Provide a real WAV of the reference for the voice test; no fabricated grades. Stage 5 packages reports for human review.
+
+## Local evidence
+`python -m pytest -q`: 229 passed, 13 subtests passed. New checks use mocked model outputs and mocked news/official results. Two existing tests were updated to mock the new official-search path, not the old RSS route. No CUDA or live Colab inference, actual website access, actual ASR recording or real grade was measured here. The user's previous 7.67/10 is not a certification of this build. Approve only after two reviewed runs of this build at >=8/10 each (including voice and no critical failures), and matching deployment runtime.

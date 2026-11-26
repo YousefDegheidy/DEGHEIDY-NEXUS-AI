@@ -1,6 +1,18 @@
-gradio>=5.0,<7.0
+gradio==5.50.0
 numpy>=1.24
 librosa>=0.10.1
-faster-whisper>=1.2.0,<2.0
+faster-whisper>=1.2.0,<2
 webrtcvad-wheels>=2.0.13
-# For GPU chat: torch, transformers>=4.57,<5, accelerate, bitsandbytes
+requests>=2.31
+ddgs
+# GPU chat (choose via notebook):
+transformers>=5.0,<6
+accelerate>=1.0
+bitsandbytes>=0.45
+
+# Publisher URL resolution and readable article-body extraction
+gnews-decoder>=0.1.1,<1
+trafilatura>=2.0,<3
+
+# Automated source tests in the notebook
+pytest>=8.0,<10

@@ -1,0 +1,8 @@
+# Resolve jointly so Unsloth cannot silently select Transformers 4.x for Qwen3.5.
+unsloth
+unsloth_zoo
+transformers>=5.0,<6
+peft
+accelerate
+bitsandbytes
+datasets
